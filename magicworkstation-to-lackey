@@ -1,0 +1,217 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+ magicworkstation-to-lackey
+
+=head1 SYNOPSIS
+
+ magicworkstation-to-lackey "Set Name" < file
+
+=head1 DESCRIPTION
+
+Export a Magic Workstation deck to a file, and this script
+will convert it into Lackey format with the user-specified
+set name.
+
+=cut
+
+use strict;
+use warnings;
+
+my $set = shift or die 'No set provided';
+
+my @cols = qw(Name Set ImageFile Color Cost ConvertedCost Type Power Toughness Rarity Text);
+
+# MW special codes -> Lackey codes
+my %codemap = (
+    D => '(w/u)',    V => '(u/b)',    K => '(b/r)',
+    L => '(r/g)',    A => '(g/w)',    O => '(w/b)',
+    I => '(u/r)',    Q => '(b/g)',    P => '(r/w)',
+    S => '(g/u)',    C => '{Q}',  # Untap
+);
+
+# Output the Lackey header first.
+print join("\t", @cols), "\r\n";
+
+# Skim over any header lines until we get to the card name.
+while (<>) {
+    next unless /^Card Name:/;
+    read_card($_);
+}
+
+# Actually read in and output a card.
+sub read_card {
+    my %cols;
+    my $last_key;
+    
+    # We've already read the first line, so we need a hack to process that
+    # line before we read from STDIN again.
+    my $first_line = shift;
+    while ( my $line = $first_line || <> ) {
+        $first_line = undef; # Don't use it again
+        $line =~ s/\r?\n$//;
+        last if $line eq ''; # End of card
+        
+        if ( $line =~ /^\t+/ ) {
+            # Continuation of previous line
+            defined $last_key or die "Continuation, but no previous field!";
+            if ( $last_key eq 'Card Text' ) {
+                $cols{Text} .= convert_mw_text($line);
+            }
+            next;
+        }
+        
+        my ( $key, $value ) = ($line =~ /^([^:]*):\s*(.*)$/);
+        $last_key = $key;
+        if ( $key eq 'Card Name' ) {
+            $cols{Name} = $value;
+        }
+        elsif ( $key eq 'Card Color' ) {
+            # It's tempting to use this for Lackey's "color" column, but that's
+            # misleading, as the card colour can be different to the mana.
+        }
+        elsif ( $key eq 'Mana Cost' ) {
+            if ( $value eq '' ) {
+                $cols{Cost} = '';
+                $cols{ConvertedCost} = 0;
+                $cols{Color} = '';
+            }
+            else {
+                my @comps = split_mw_cost($value);
+                $cols{Cost} = lackey_cost(@comps);
+                $cols{ConvertedCost} = cmc(@comps);
+                # Base card colour(s) derived from mana cost
+                $cols{Color} = uniq_colors(@comps);
+            }
+        }
+        elsif ( $key eq 'Type & Class' ) {
+            $cols{Type} = $value;
+        }
+        elsif ( $key eq 'Pow/Tou' ) {
+            if ( $value eq '' ) {
+                $cols{Power} = '';
+                $cols{Toughness} = '';
+            }
+            elsif ( $value =~ /^%(\d+)#$/ ) {
+                # Planeswalker loyalty. Lackey uses a negative power, ugh.
+                $cols{Power} = -$1;
+                $cols{Toughness} = '';
+            }
+            else {
+                my ($pow, $tou) = ($value =~ m{(\d+)/(\d+)});
+                $cols{Power} = $pow || 0;
+                $cols{Toughness} = $tou || 0;
+            }
+        }
+        elsif ( $key eq 'Rarity' ) {
+            # Lackey rarity is one of: L, C, U, R, M
+            # The exporter does C, U, R correctly, but marks M and L as C.
+            # Manual overrides will be needed in those cases.
+            $cols{Rarity} = $value;
+        }
+        elsif ( $key eq 'Card #' ) {
+            # The image file will be the card number.jpg
+            my ($num, $total) = ($value =~ m{(\d+)/(\d+)});
+            $cols{ImageFile} = $num;
+        }
+        elsif ( $key eq 'Card Text' ) {            
+            $cols{Text} ||= '';
+            $cols{Text} .= convert_mw_text($value);
+        }
+        elsif ( $key =~ /^(Artist|Flavor Text)$/ ) {
+            # ignored
+        }
+        else {
+            die "Unrecognised key '$key' (with value '$value')\n";
+        }
+    }
+    
+    # Post-process the card color to include A if artifact, L if land
+    $cols{Color} .= 'A' if $cols{Type} =~ /\bArtifact\b/;
+    $cols{Color} .= 'L' if $cols{Type} =~ /\bLand\b/;
+    $cols{Color} ||= '';  # No color - non-Artifact, nonland, colorless cost
+    
+    # Set is user-specified
+    $cols{Set} = $set;
+    
+    # Output
+    print join("\t", map { $cols{$_} } @cols), "\r\n";
+}
+
+# Split a string like 'R/GR/G' or '12/U' into an array of components
+sub split_mw_cost {
+    my $str = shift;
+    my @comps;
+    # Parse from right to left, to avoid seeing 21/W as [21, /W]
+    while ( $str ne '' ) {
+        if ($str =~ s{([12BGRUW])/([BGRUW])$}{}) {
+            push @comps, [$1, $2]; # dual mana
+        }
+        elsif ($str =~ s{([BGRUW]|X|\d+)$}{}) {
+            push @comps, $1;  # single mana
+        }
+        else {
+            die "Don't know how to parse '$str'";
+        }
+    }
+    return reverse @comps;
+}
+
+# Return Lackey-format mana cost string (e.g. 5(2/W)(2/W)R)
+sub lackey_cost {
+    my @comps = @_;
+    return join '', map {
+        ref $_ eq 'ARRAY' ? ('(' . join('/',@$_) . ')') : $_
+    } @comps;
+}
+
+# Calculate CMC from cost components
+sub cmc {
+    my @comps = @_;
+    my $cmc = 0;
+    for (@comps) {
+        if (ref $_ eq 'ARRAY') {
+            if ($_->[0] =~ /^\d+$/) {
+                $cmc += $_->[0];  # 1/R, 2/R etc.
+            }
+            else {
+                $cmc ++;  # Regular dual land
+            }
+        }
+        elsif( $_ =~ /^[BGRUWX]$/ ) {
+            $cmc ++;
+        }
+        elsif( $_ =~ /^(\d+)$/ ) {
+            $cmc += $_;
+        }
+        else {
+            die "Unknown component '$_'";
+        }
+    }
+    return $cmc;
+}
+
+# Return a string of unique colours used in the mana cost
+sub uniq_colors {
+    my @comps = @_;
+    return '' unless @comps;
+    my %h;
+    # Flatten, grep to colours only, uniq
+    my @colors = map  { $h{$_}++ == 0 ? $_ : () }
+                 grep { /^[BGRUW]$/ }
+                 map  { ref $_ eq 'ARRAY' ? @{$_} : $_ } @comps;
+    return join('' => @colors);
+    
+}
+
+# Convert MW markup to Lackey standard notation
+sub convert_mw_text {
+    my $text = shift;
+    $text =~ s/\t/ /g; # Tabs are dangerous!
+    $text =~ s/%([TX0-9BGRUW])/\{$1\}/g; # %T -> {T} etc.
+    while ( my ($mw, $lackey) = each %codemap ) {
+        $text =~ s/%$mw/\{$lackey\}/g;
+    }
+    return $text;    
+}

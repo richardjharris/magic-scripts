@@ -1,4 +1,4 @@
 magic-scripts
 =============
 
-Magic: The Gathering random scripts
+Various Magic: The Gathering card format conversion utilities.

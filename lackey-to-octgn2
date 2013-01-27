@@ -1,0 +1,100 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+lackey-to-octgn2
+
+=head1 SYNOPSIS
+
+lackey-to-octgn2 indir outdir [UUID]
+
+=head1 DESCRIPTION
+
+Converts a directory of Lackey-format cards into OCTGN2 format.
+C<UUID> is the octgn2 Game ID. It defaults to
+C<A6C8D2E8-7CD8-11DD-8F94-E62B56D89593>, which should probably work.
+
+=head1 CAVEATS
+
+This only refers to the card name - not its exact ID - so you will get an
+arbitrary version of each Land. You can obviously change this later.
+
+=cut
+
+use strict;
+use warnings;
+
+use File::Basename;
+use File::Spec::Functions qw(catfile);
+use XML::Mini::Document;
+
+$XML::Mini::AutoEscapeEntities = 0;  # Pass-through entities
+
+my $indir = shift;
+-d $indir or die "'$indir' is a not a directory!";
+my $outdir = shift;
+-d $outdir or die "'$outdir' is not a directory!";
+
+my $UUID = shift || "A6C8D2E8-7CD8-11DD-8F94-E62B56D89593";
+warn "Using UUID $UUID\n";
+
+my @decks = glob(catfile($indir, '*.dek'));
+for my $inpath ( @decks ) {
+    my $infile = basename($inpath);
+    $infile =~ s/\.dek$//;
+    # Read *.dek, write *.o8d in $outdir
+    warn "Converting '$infile'...\n";
+    convert_deck( $UUID, $inpath, catfile( $outdir, $infile.'.o8d' ) );
+}
+
+sub convert_deck {
+    my ($uuid, $inFile, $outFile) = @_;
+    my $inXML = XML::Mini::Document->new;
+    $inXML->fromFile( $inFile );
+    my $in = $inXML->toHash();
+    my $out = {};
+    $out->{deck}{game} = $uuid;
+    $out->{deck}{section} = [];
+   
+    # Loop card zones (Main, Sideboard)
+    my $zones = $in->{deck}->{superzone};
+    for my $zone ( @$zones ) {
+        next unless exists $zone->{card};
+        my %cards;
+        
+        # Loop through cards
+        my $out_cards = [];
+        for my $card ( @{ $zone->{card} } ) {
+            my $name = $card->{name}{'-content'};
+            
+            # Is card already in deck?
+            if ( $cards{$name} ) {
+                $cards{$name}->{qty} ++;
+            }
+            else {
+                my $out_card = {};
+                $out_card->{'-content'} = $card->{name}{'-content'};
+                $out_card->{qty} = 1;
+                push @$out_cards, $out_card;
+                $cards{$name} = $out_card;
+            }
+        }
+        
+        my $out_zone = {};
+        $out_zone->{name} = $zone->{name};
+        $out_zone->{name} = 'Main' if $out_zone->{name} eq 'Deck';
+        $out_zone->{card} = $out_cards;
+        push @{ $out->{deck}{section} }, $out_zone;
+    }
+    
+    my $outXML = XML::Mini::Document->new;
+    $outXML->fromHash($out, { attributes => {
+        deck    => 'game',
+        section => 'name',
+        card    => 'qty',
+    }});
+    my $outString = $outXML->toString;
+    open my $outFH, '>', $outFile or die "Unable to open '$outFile' for writing: $!";
+    print {$outFH} '<?xml version="1.0" encoding="utf-8"?>', "\n";
+    print {$outFH} $outString;
+}
